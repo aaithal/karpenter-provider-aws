@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unique"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -28,6 +29,7 @@ import (
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -307,11 +309,58 @@ func NewInstanceType(
 			SystemReserved:    systemReservedResources(systemReserved),
 			EvictionThreshold: evictionThreshold(memory(ctx, info), ephemeralStorage(info, amiFamily, blockDeviceMappings, instanceStorePolicy), evictionHard),
 		},
+		DynamicResources: cloudprovider.DynamicResources{
+			ResourceSliceTemplates: bandwidthSlicesFor(info),
+		},
 	}
 	if it.Requirements.Compatible(scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, string(corev1.Windows)))) == nil {
 		it.Capacity[v1.ResourcePrivateIPv4Address] = *privateIPv4Address(string(info.InstanceType))
 	}
 	return it
+}
+
+const bandwidthDRADriver = "bandwidth.networking.aws" // must match the DeviceClass CEL selector
+
+// bandwidthSlicesFor emits one exclusive 1-Gbps DRA device per whole Gbps of guaranteed
+// baseline network bandwidth, but ONLY for "guaranteed" sizes where baseline == peak.
+// Burstable sizes (baseline < peak) return nil, so no bandwidth devices are modeled for them.
+// These templates drive Karpenter's pre-launch DRA scheduling simulation; a runtime DRA driver
+// must publish matching ResourceSlices on the node for pods to actually bind post-launch.
+func bandwidthSlicesFor(info ec2types.InstanceTypeInfo) []*cloudprovider.ResourceSliceTemplate {
+	if info.NetworkInfo == nil || info.NetworkInfo.DefaultNetworkCardIndex == nil {
+		return nil
+	}
+	idx := int(lo.FromPtr(info.NetworkInfo.DefaultNetworkCardIndex))
+	if idx >= len(info.NetworkInfo.NetworkCards) {
+		return nil
+	}
+	card := info.NetworkInfo.NetworkCards[idx]
+	if card.BaselineBandwidthInGbps == nil || card.PeakBandwidthInGbps == nil {
+		return nil
+	}
+	baseline, peak := lo.FromPtr(card.BaselineBandwidthInGbps), lo.FromPtr(card.PeakBandwidthInGbps)
+	if baseline != peak { // burstable ("Up to") — no guaranteed bandwidth to model
+		return nil
+	}
+	gbps := int(math.Floor(baseline))
+	if gbps <= 0 {
+		return nil
+	}
+	devices := make([]cloudprovider.Device, 0, gbps)
+	for i := 0; i < gbps; i++ {
+		devices = append(devices, cloudprovider.Device{
+			Name:                     unique.Make(fmt.Sprintf("%s-gbps-%d", string(info.InstanceType), i)),
+			AllowMultipleAllocations: false, // exclusive: a count:N claim grabs N devices = N Gbps
+			Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+				"bandwidth": {Value: resource.MustParse("1")},
+			},
+		})
+	}
+	return []*cloudprovider.ResourceSliceTemplate{{
+		Driver:  unique.Make(bandwidthDRADriver),
+		Pool:    cloudprovider.ResourcePool{Name: unique.Make(fmt.Sprintf("%s-bandwidth", string(info.InstanceType)))},
+		Devices: devices,
+	}}
 }
 
 //nolint:gocyclo

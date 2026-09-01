@@ -474,6 +474,75 @@ var _ = Describe("InstanceTypeProvider", func() {
 			Expect(expected.Has(string(override.InstanceType))).To(BeTrue(), fmt.Sprintf("expected %s to exist in set", string(override.InstanceType)))
 		}
 	})
+	It("should model guaranteed-bandwidth DRA ResourceSliceTemplates per instance type", func() {
+		// A guaranteed size (baseline==peak) and a burstable size (baseline<peak).
+		instanceTypes := []ec2types.InstanceTypeInfo{
+			{
+				InstanceType:                 "c8i.8xlarge",
+				SupportedUsageClasses:        fake.DefaultSupportedUsageClasses,
+				SupportedVirtualizationTypes: []ec2types.VirtualizationType{"hvm"},
+				ProcessorInfo:                &ec2types.ProcessorInfo{SupportedArchitectures: []ec2types.ArchitectureType{ec2types.ArchitectureTypeX8664}},
+				VCpuInfo:                     &ec2types.VCpuInfo{DefaultCores: aws.Int32(16), DefaultVCpus: aws.Int32(32)},
+				MemoryInfo:                   &ec2types.MemoryInfo{SizeInMiB: aws.Int64(65536)},
+				NetworkInfo: &ec2types.NetworkInfo{
+					Ipv4AddressesPerInterface: aws.Int32(10),
+					DefaultNetworkCardIndex:   aws.Int32(0),
+					NetworkCards: []ec2types.NetworkCardInfo{{
+						NetworkCardIndex:         aws.Int32(0),
+						MaximumNetworkInterfaces: aws.Int32(8),
+						BaselineBandwidthInGbps:  aws.Float64(15.0),
+						PeakBandwidthInGbps:      aws.Float64(15.0),
+					}},
+				},
+			},
+			{
+				InstanceType:                 "c8i.4xlarge",
+				SupportedUsageClasses:        fake.DefaultSupportedUsageClasses,
+				SupportedVirtualizationTypes: []ec2types.VirtualizationType{"hvm"},
+				ProcessorInfo:                &ec2types.ProcessorInfo{SupportedArchitectures: []ec2types.ArchitectureType{ec2types.ArchitectureTypeX8664}},
+				VCpuInfo:                     &ec2types.VCpuInfo{DefaultCores: aws.Int32(8), DefaultVCpus: aws.Int32(16)},
+				MemoryInfo:                   &ec2types.MemoryInfo{SizeInMiB: aws.Int64(32768)},
+				NetworkInfo: &ec2types.NetworkInfo{
+					Ipv4AddressesPerInterface: aws.Int32(10),
+					DefaultNetworkCardIndex:   aws.Int32(0),
+					NetworkCards: []ec2types.NetworkCardInfo{{
+						NetworkCardIndex:         aws.Int32(0),
+						MaximumNetworkInterfaces: aws.Int32(8),
+						BaselineBandwidthInGbps:  aws.Float64(7.5),
+						PeakBandwidthInGbps:      aws.Float64(15.0),
+					}},
+				},
+			},
+		}
+		awsEnv.EC2API.DescribeInstanceTypesOutput.Set(&ec2.DescribeInstanceTypesOutput{
+			InstanceTypes: instanceTypes,
+		})
+		awsEnv.EC2API.DescribeInstanceTypeOfferingsOutput.Set(&ec2.DescribeInstanceTypeOfferingsOutput{
+			InstanceTypeOfferings: fake.MakeInstanceOfferings(instanceTypes),
+		})
+		Expect(awsEnv.InstanceTypesProvider.UpdateInstanceTypes(ctx)).To(Succeed())
+		Expect(awsEnv.InstanceTypesProvider.UpdateInstanceTypeOfferings(ctx)).To(Succeed())
+
+		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+		its, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+		Expect(err).To(BeNil())
+
+		byName := lo.SliceToMap(its, func(it *corecloudprovider.InstanceType) (string, *corecloudprovider.InstanceType) {
+			return it.Name, it
+		})
+		Expect(byName).To(HaveKey("c8i.8xlarge"))
+		Expect(byName).To(HaveKey("c8i.4xlarge"))
+
+		// Guaranteed size: one template, 15 exclusive 1-Gbps devices, expected driver + pool.
+		guaranteed := byName["c8i.8xlarge"].DynamicResources.ResourceSliceTemplates
+		Expect(guaranteed).To(HaveLen(1))
+		Expect(guaranteed[0].Devices).To(HaveLen(15))
+		Expect(guaranteed[0].Driver.Value()).To(Equal("bandwidth.networking.aws"))
+		Expect(guaranteed[0].Pool.Name.Value()).To(Equal("c8i.8xlarge-bandwidth"))
+
+		// Burstable size: no bandwidth templates.
+		Expect(byName["c8i.4xlarge"].DynamicResources.ResourceSliceTemplates).To(BeEmpty())
+	})
 	It("should order the instance types by price and only consider the spot types that are cheaper than the cheapest on-demand", func() {
 		instances := fake.MakeInstances()
 		awsEnv.EC2API.DescribeInstanceTypesOutput.Set(&ec2.DescribeInstanceTypesOutput{
